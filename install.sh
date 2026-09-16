@@ -4,13 +4,14 @@
 #
 #  Architecture (client = Iran, server = abroad):
 #    Xray WG outbound -> UdpStatelessSocket -> WireGuardDevice -> PacketsToConnection
+#      -> VlessClient (carries each flow's destination inside the tunnel)
 #      -> ConnectionFisherClient (racing) -> RealityClient (REAL TLS camouflage)
-#      -> TCP:443 -> [server] ConnectionFisherServer -> RealityServer
+#      -> TCP:443 -> [server] RealityServer -> ConnectionFisherServer -> VlessServer
 #      -> TcpUdpConnector(dest_context) -> Internet
 #
 #  Roles:
-#    install.sh server  --port 443 [--cover www.microsoft.com] [--password X]
-#    install.sh client  --server IP --port 443 --password X [options]
+#    install.sh server  --port 443 [--cover www.microsoft.com] [--password X --uuid Y]
+#    install.sh client  --server IP --port 443 --password X --uuid Y [options]
 #    install.sh print-xray-outbound    (client: print panel outbound JSON)
 #    install.sh update                 (upgrade waterwall binary)
 #    install.sh uninstall
@@ -20,6 +21,7 @@ set -euo pipefail
 GWT_VERSION="1.0.0"
 WATERWALL_VERSION="v1.46.9"
 WATERWALL_URL_BASE="https://github.com/radkesvat/WaterWall/releases/download"
+GWT_RAW_BASE="https://raw.githubusercontent.com/DashSaman/GoldWaterTunnel/main"
 INSTALL_DIR="/etc/goldwater"
 LOG_DIR="/var/log/goldwater"
 STATE_DIR="/var/lib/goldwater"
@@ -613,8 +615,8 @@ install_watchdog() {
   if [ ! -f /root/.ssh/id_ed25519_goldwater ]; then
     ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519_goldwater -C goldwater-watchdog >/dev/null 2>&1 || true
   fi
-  install -m 755 "$(dirname "$0")/watchdog.sh" /usr/local/bin/goldwater-watchdog 2>/dev/null \
-    || install -m 755 "$INSTALL_DIR/watchdog.sh" /usr/local/bin/goldwater-watchdog
+  fetch_repo_file "watchdog.sh" /usr/local/bin/goldwater-watchdog \
+    || die "watchdog.sh not found next to install.sh and GitHub unreachable"
 
   cat > /etc/systemd/system/goldwater-watchdog.service <<EOF
 [Unit]
@@ -639,11 +641,22 @@ EOF
 #===============================================================================
 #  WaterWall-Test command
 #===============================================================================
+fetch_repo_file() { # $1 = repo file name, $2 = destination
+  local src
+  src="$(dirname "$0")/$1"
+  if [ -f "$src" ]; then
+    install -m 755 "$src" "$2"
+    return 0
+  fi
+  say "downloading $1 from GitHub ..."
+  curl -fsSL --retry 3 --connect-timeout 15 "$GWT_RAW_BASE/$1" -o "$2" 2>/dev/null && chmod 755 "$2" && return 0
+  return 1
+}
+
 install_test_cmd() {
-  local src; src="$(dirname "$0")/WaterWall-Test"
-  [ -f "$src" ] || src="$INSTALL_DIR/WaterWall-Test"
-  [ -f "$src" ] || die "WaterWall-Test script not found next to install.sh"
-  install -m 755 "$src" "$TEST_CMD"
+  fetch_repo_file "WaterWall-Test" "$TEST_CMD" \
+    || die "WaterWall-Test not found next to install.sh and GitHub unreachable.
+Download manually: curl -fL $GWT_RAW_BASE/WaterWall-Test -o $TEST_CMD && chmod +x $TEST_CMD"
   ok "installed $TEST_CMD"
 }
 
