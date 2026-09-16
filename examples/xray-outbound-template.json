@@ -1,0 +1,18 @@
+{
+  "_comment": "After `install.sh client`, the real file with real keys is generated at /etc/goldwater/xray-outbound.json on the Iran (client) server. Add its contents to your x-ui panel: Xray Configs -> Outbounds. This template shows the shape only.",
+  "tag": "waterwall-wg",
+  "protocol": "wireguard",
+  "settings": {
+    "secretKey": "<GENERATED_CLIENT_PRIVATE_KEY>",
+    "address": ["10.44.0.2/32"],
+    "peers": [
+      {
+        "publicKey": "<GENERATED_WATERWALL_SERVER_PUBLIC_KEY>",
+        "endpoint": "127.0.0.1:51820",
+        "keepAlive": 25
+      }
+    ],
+    "mtu": 1420,
+    "kernelMode": false
+  }
+}

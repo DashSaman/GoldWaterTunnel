@@ -1,0 +1,14 @@
+[
+  {
+    "_comment": "Route DNS queries through the tunnel (put FIRST in routing rules)",
+    "type": "field",
+    "ip": ["198.18.0.2/32"],
+    "outboundTag": "waterwall-wg"
+  },
+  {
+    "_comment": "Send any inbound you choose through the tunnel (repeat per inbound)",
+    "type": "field",
+    "inboundTag": ["YOUR-INBOUND-TAG"],
+    "outboundTag": "waterwall-wg"
+  }
+]
