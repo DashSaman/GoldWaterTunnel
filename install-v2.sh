@@ -19,7 +19,7 @@
 #===============================================================================
 set -euo pipefail
 
-GWT_VERSION="2.0.0"
+GWT_VERSION="2.1.0"
 WG_DIR="/etc/wireguard"
 GWT_DIR="/etc/goldwater-v2"
 
@@ -91,10 +91,22 @@ PrivateKey = $PRIV
 Address = ${NET}.1/24
 ListenPort = $PORT
 Table = off
-PostUp = sysctl -qw net.ipv4.ip_forward=1; iptables -I FORWARD 1 -i %i -j ACCEPT; iptables -I FORWARD 1 -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -I POSTROUTING 1 -s ${NET}.0/24 -j MASQUERADE
-PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -s ${NET}.0/24 -j MASQUERADE
+PostUp = sysctl -qw net.ipv4.ip_forward=1; iptables -I FORWARD 1 -i %i -j ACCEPT; iptables -I FORWARD 1 -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -I POSTROUTING 1 -s ${NET}.0/24 -j MASQUERADE; iptables -t mangle -I FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; iptables -t mangle -I FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -s ${NET}.0/24 -j MASQUERADE; iptables -t mangle -D FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; iptables -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 EOF
   chmod 600 "$WG_DIR/$IFNAME.conf"
+
+  # kernel/network tuning for high-throughput, many-flow tunnels
+  cat > /etc/sysctl.d/99-goldwater-v2.conf <<EOF
+# GoldWaterTunnel v2 tuning
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.netdev_max_backlog = 16384
+net.core.somaxconn = 8192
+net.ipv4.udp_mem = 65536 131072 262144
+net.netfilter.nf_conntrack_max = 262144
+EOF
+  sysctl --system >/dev/null 2>&1 || true
 
   echo "GWT_IF=$IFNAME" > "$GWT_DIR/server.env"
   echo "GWT_PORT=$PORT" >> "$GWT_DIR/server.env"
@@ -177,9 +189,17 @@ MTU = 1380
 PublicKey = $SERVER_PUB
 Endpoint = ${SERVER}:${PORT}
 AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 15
+PersistentKeepalive = 10
 EOF
   chmod 600 "$WG_DIR/$IFNAME.conf"
+
+  # UDP socket buffers help both the kernel interface and userspace (Xray) WG
+  cat > /etc/sysctl.d/99-goldwater-v2.conf <<EOF
+# GoldWaterTunnel v2 tuning
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+EOF
+  sysctl --system >/dev/null 2>&1 || true
 
   # Save for outbound generation
   cat > "$GWT_DIR/$SERVER/client.env" <<EOF
@@ -245,7 +265,12 @@ EOF
 }
 
 #===============================================================================
-# OUTBOUND (print Xray JSON)
+#  OUTBOUND (print Xray JSON — with a DEDICATED Xray peer)
+#
+#  The kernel interface (used by `test`) and the panel's userspace Xray outbound
+#  must NEVER share one key: the server would bounce the endpoint between the two
+#  sessions (roaming ping-pong) and drop packets intermittently. We therefore
+#  generate a second peer identity just for Xray.
 #===============================================================================
 do_outbound() {
   local SERVER="${1:?Usage: outbound FOREIGN_IP}"
@@ -254,17 +279,40 @@ do_outbound() {
   # shellcheck disable=SC1090
   source "$env_file"
 
+  # dedicated Xray peer (own key + own tunnel IP, never equal to the kernel one)
+  if [ -z "${GWT_XPRIV:-}" ]; then
+    local LAST XPRIV XPUB
+    LAST=$(echo "$SERVER" | awk -F. '{print $4}')
+    [[ "$LAST" =~ ^[0-9]+$ ]] || LAST=0
+    XPRIV=$(wg genkey)
+    XPUB=$(echo "$XPRIV" | wg pubkey)
+    local XADDR="${GWT_NET}.$(( ((LAST + 100) % 249) + 2 ))"
+    [ "$XADDR" = "$GWT_ADDR" ] && XADDR="${GWT_NET}.$(( ((LAST + 101) % 249) + 2 ))"
+    cat >> "$env_file" <<EOF
+GWT_XPRIV=$XPRIV
+GWT_XPUB=$XPUB
+GWT_XADDR=$XADDR
+EOF
+    chmod 600 "$env_file"
+    # re-source to pick up the new values
+    source "$env_file"
+    warn "New Xray peer generated ($GWT_XADDR). Run on the SERVER first:"
+    echo ""
+    echo "  install-v2.sh addpeer --pub $GWT_XPUB --ip $GWT_XADDR"
+    echo ""
+  fi
+
   cat <<EOF
 {
   "tag": "WaterWall-${GWT_SERVER}",
   "protocol": "wireguard",
   "settings": {
-    "secretKey": "${GWT_CLIENT_PRIV}",
-    "address": ["${GWT_ADDR:-${GWT_NET}.2}/32"],
+    "secretKey": "${GWT_XPRIV}",
+    "address": ["${GWT_XADDR}/32"],
     "peers": [{
       "publicKey": "${GWT_SERVER_PUB}",
       "endpoint": "${GWT_SERVER}:${GWT_PORT}",
-      "keepAlive": 15
+      "keepAlive": 10
     }],
     "mtu": 1380,
     "kernelMode": false
