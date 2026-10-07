@@ -172,16 +172,16 @@ EOF
 #  SERVER ROLE (abroad)
 #===============================================================================
 do_server() {
-  local PORT="443" COVER="www.microsoft.com" RSECRET="" WORKERS="" UUID=""
+  local PORT="443" COVER="www.microsoft.com" PASSWORD="" WORKERS="" UUID=""
   while [ $# -gt 0 ]; do case "$1" in
     --port) PORT="$2"; shift 2 ;;
     --cover) COVER="$2"; shift 2 ;;
-    --password) RSECRET="$2"; shift 2 ;;
+    --password) PASSWORD="$2"; shift 2 ;;
     --uuid) UUID="$2"; shift 2 ;;
     --workers) WORKERS="$2"; shift 2 ;;
     *) die "unknown option: $1" ;;
   esac done
-  [ -n "$RSECRET" ] || RSECRET="$(rand_pass)"
+  [ -n "$PASSWORD" ] || PASSWORD="$(rand_pass)"
   [ -n "$UUID" ] || UUID="$(cat /proc/sys/kernel/random/uuid)"
 
   # stop a previous instance so the port check and re-install work cleanly
@@ -222,8 +222,7 @@ EOF
     {
       "name": "reality", "type": "RealityServer",
       "settings": {
-        "password"
-          : "$RSECRET",
+        "password": "$PASSWORD",
         "algorithm": "aes-gcm",
         "destination": "visitor",
         "sniffing-attempts": 8
@@ -302,7 +301,7 @@ ${C_Green}============================================================
  GoldWaterTunnel SERVER installed successfully
 ============================================================${C_Off}
   Listen port : TCP $PORT
- Reality pass: $RSECRET   (needed by the client: --password)
+ Reality pass: $PASSWORD   (needed by the client: --password)
      VLESS id: $UUID       (needed by the client: --uuid)
  Cover domain: $COVER
  Service     : systemctl status waterwall
@@ -317,12 +316,12 @@ SUMMARY
 #  CLIENT ROLE (Iran)
 #===============================================================================
 do_client() {
-  local SERVER="" PORT="443" RSECRET="" COVER="www.microsoft.com" WG_PORT="51820" \
+  local SERVER="" PORT="443" PASSWORD="" COVER="www.microsoft.com" WG_PORT="51820" \
         TEST_PORT="40000" FISHER="2" WORKERS="" SERVER_SSH="root@" UUID=""
   while [ $# -gt 0 ]; do case "$1" in
     --server) SERVER="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
-    --password) RSECRET="$2"; shift 2 ;;
+    --password) PASSWORD="$2"; shift 2 ;;
     --uuid) UUID="$2"; shift 2 ;;
     --cover) COVER="$2"; shift 2 ;;
     --wg-port) WG_PORT="$2"; shift 2 ;;
@@ -333,7 +332,7 @@ do_client() {
     *) die "unknown option: $1" ;;
   esac done
   [ -n "$SERVER" ] || die "--server <foreign-server-ip> is required"
-  [ -n "$RSECRET" ] || die "--password <reality-password> is required (same as server)"
+  [ -n "$PASSWORD" ] || die "--password <reality-password> is required (same as server)"
   [ -n "$UUID" ] || UUID="$(cat /proc/sys/kernel/random/uuid)"
   WORKERS="${WORKERS:-$(detect_workers)}"
 
@@ -434,8 +433,7 @@ EOF
         "sni": "$COVER",
         "verify": true,
         "x25519mlkem768": false,
-        "password"
-          : "$RSECRET",
+        "password": "$PASSWORD",
         "algorithm": "aes-gcm"
       },
       "next": "uplink"
@@ -476,8 +474,7 @@ EOF
         "sni": "$COVER",
         "verify": true,
         "x25519mlkem768": false,
-        "password"
-          : "$RSECRET",
+        "password": "$PASSWORD",
         "algorithm": "aes-gcm"
       },
       "next": "test-uplink"
