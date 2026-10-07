@@ -19,7 +19,7 @@
 #===============================================================================
 set -euo pipefail
 
-GWT_VERSION="2.2.1"
+GWT_VERSION="2.2.2"
 WG_DIR="/etc/wireguard"
 GWT_DIR="/etc/goldwater-v2"
 
@@ -139,9 +139,9 @@ EOF
 do_client() {
   local SERVER="" PORT="52000" SERVER_PUB="" NAT_MODE=""
   while [ $# -gt 0 ]; do case "$1" in
-    --server)      SERVER="$2"; shift 2 ;;
-    --port)        PORT="$2"; shift 2 ;;
-    --server-pub)  SERVER_PUB="$2"; shift 2 ;;
+    --server)      [ $# -ge 2 ] || die "--server requires a value"; SERVER="$2"; shift 2 ;;
+    --port)        [ $# -ge 2 ] || die "--port requires a value"; PORT="$2"; shift 2 ;;
+    --server-pub)  [ $# -ge 2 ] || die "--server-pub requires a value"; SERVER_PUB="$2"; shift 2 ;;
     --nat)         NAT_MODE="1"; shift ;;
     *) shift ;;
   esac done
@@ -149,6 +149,16 @@ do_client() {
   [ -n "$SERVER" ] || die "--server <foreign-ip> required"
   [ -n "$SERVER_PUB" ] || die "--server-pub <key> required (from server output)"
   [[ "$SERVER" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "--server must be an IPv4 address"
+  local OCTET
+  local -a OCTETS
+  IFS=. read -r -a OCTETS <<< "$SERVER"
+  for OCTET in "${OCTETS[@]}"; do
+    [ "$((10#$OCTET))" -le 255 ] || die "--server must be an IPv4 address"
+  done
+  [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || die "--port must be between 1 and 65535"
+  PORT=$((10#$PORT))
+  [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port must be between 1 and 65535"
+  [[ "$SERVER_PUB" =~ ^[A-Za-z0-9+/]{43}=$ ]] || die "--server-pub must be a WireGuard public key"
 
   require_root
   ensure_wg
@@ -168,25 +178,50 @@ do_client() {
   LAST=$(echo "$SERVER" | awk -F. '{print $4}')
   [[ "$LAST" =~ ^[0-9]+$ ]] || LAST=0
   local IFNAME="gwt${LAST}"
+  LAST=$((10#$LAST))
   # One flat tunnel subnet 10.70.0.0/24 (server holds 10.70.0.1).
   # Each foreign server gets a unique host address derived from its last octet.
   local NET="10.70.0"
   local ADDR="${NET}.$(( (LAST % 249) + 2 ))"
 
-  # reuse existing keys on re-install so reruns never orphan the server-side peer
   local CONF="$WG_DIR/$IFNAME.conf"
-  local PRIV PUB
-  if [ -f "$CONF" ] && grep -q '^PrivateKey' "$CONF"; then
-    PRIV=$(grep -m1 '^PrivateKey' "$CONF" | awk '{print $3}')
-    PUB=$(echo "$PRIV" | wg pubkey)
-    say "reusing existing keys for $IFNAME (idempotent re-install)"
-  else
-    PRIV=$(wg genkey)
-    PUB=$(echo "$PRIV" | wg pubkey)
+  local ENV="$GWT_DIR/$SERVER/client.env"
+  local WORK HAD_CONF=0 HAD_ENV=0 WAS_UP=0
+  mkdir -p "$WG_DIR" "$GWT_DIR/$SERVER" || die "could not create client directories"
+  WORK=$(mktemp -d "$WG_DIR/.gwt-client.XXXXXX") || die "could not create client staging directory"
+
+  # Snapshot both files before changing either or stopping the existing tunnel.
+  if [ -e "$CONF" ] || [ -L "$CONF" ]; then
+    [ -f "$CONF" ] && cp -p -- "$CONF" "$WORK/previous.conf" \
+      || die "could not snapshot $CONF; tunnel untouched (staging: $WORK)"
+    HAD_CONF=1
+  fi
+  if [ -e "$ENV" ] || [ -L "$ENV" ]; then
+    [ -f "$ENV" ] && cp -p -- "$ENV" "$WORK/previous.env" \
+      || die "could not snapshot $ENV; tunnel untouched (staging: $WORK)"
+    HAD_ENV=1
+  fi
+  if ip link show "$IFNAME" >/dev/null 2>&1; then
+    WAS_UP=1
+    [ "$HAD_CONF" = "1" ] \
+      || die "$IFNAME exists without a saved configuration; refusing teardown (staging: $WORK)"
   fi
 
-  mkdir -p "$WG_DIR" "$GWT_DIR/$SERVER"
-  cat > "$WG_DIR/$IFNAME.conf" <<EOF
+  # reuse existing keys on re-install so reruns never orphan the server-side peer
+  local PRIV PUB
+  if [ "$HAD_CONF" = "1" ] && grep -q '^PrivateKey' "$WORK/previous.conf"; then
+    PRIV=$(awk '/^PrivateKey/{print $3; exit}' "$WORK/previous.conf") \
+      || die "could not read existing key; tunnel untouched (staging: $WORK)"
+    PUB=$(printf '%s\n' "$PRIV" | wg pubkey) \
+      || die "existing private key is invalid; tunnel untouched (staging: $WORK)"
+    say "reusing existing keys for $IFNAME (idempotent re-install)"
+  else
+    PRIV=$(wg genkey) || die "could not generate client key (staging: $WORK)"
+    PUB=$(printf '%s\n' "$PRIV" | wg pubkey) \
+      || die "could not derive client public key (staging: $WORK)"
+  fi
+
+  if ! cat > "$WORK/$IFNAME.conf" <<EOF
 [Interface]
 PrivateKey = $PRIV
 Address = ${ADDR}/32
@@ -199,24 +234,19 @@ Endpoint = ${SERVER}:${PORT}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 10
 EOF
-  chmod 600 "$WG_DIR/$IFNAME.conf"
-
-  # UDP socket buffers help both the kernel interface and userspace (Xray) WG
-  cat > /etc/sysctl.d/99-goldwater-v2.conf <<EOF
-# GoldWaterTunnel v2 tuning
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-EOF
-  sysctl --system >/dev/null 2>&1 || true
+  then
+    die "could not stage client configuration; tunnel untouched (staging: $WORK)"
+  fi
 
   # Save for outbound generation
   # preserve the dedicated Xray peer identity (see do_outbound) across re-installs
   local XPEER=""
-  if [ -f "$GWT_DIR/$SERVER/client.env" ] && grep -q '^GWT_XPRIV=' "$GWT_DIR/$SERVER/client.env" 2>/dev/null; then
-    XPEER=$(grep -E '^GWT_X(PRIV|PUB|ADDR)=' "$GWT_DIR/$SERVER/client.env")
+  if [ "$HAD_ENV" = "1" ]; then
+    XPEER=$(awk '/^GWT_X(PRIV|PUB|ADDR)=/' "$WORK/previous.env") \
+      || die "could not read Xray peer identity; tunnel untouched (staging: $WORK)"
   fi
 
-  cat > "$GWT_DIR/$SERVER/client.env" <<EOF
+  if ! cat > "$WORK/client.env" <<EOF
 GWT_CLIENT_PRIV=$PRIV
 GWT_CLIENT_PUB=$PUB
 GWT_SERVER_PUB=$SERVER_PUB
@@ -227,29 +257,102 @@ GWT_ADDR=$ADDR
 GWT_GW=${NET}.1
 GWT_IF=$IFNAME
 EOF
-  [ -n "$XPEER" ] && printf '%s\n' "$XPEER" >> "$GWT_DIR/$SERVER/client.env"
-  chmod 600 "$GWT_DIR/$SERVER/client.env"
+  then
+    die "could not stage client environment; tunnel untouched (staging: $WORK)"
+  fi
+  if [ -n "$XPEER" ]; then
+    printf '%s\n' "$XPEER" >> "$WORK/client.env" \
+      || die "could not preserve Xray peer identity; tunnel untouched (staging: $WORK)"
+  fi
+  chmod 600 "$WORK/$IFNAME.conf" "$WORK/client.env" \
+    || die "could not secure staged files; tunnel untouched (staging: $WORK)"
 
-  # apply the new config with rollback safety: if the interface is already up,
-  # remember that; if recreation fails, restore the previous config and bring
-  # the tunnel back up instead of leaving it down silently.
-  local WAS_UP=0
-  ip link show "$IFNAME" >/dev/null 2>&1 && WAS_UP=1
+  # Validate WireGuard settings on a temporary, down interface before teardown.
+  local CHECK_IF="gwtv${BASHPID}" VALID=1
+  if ! wg-quick strip "$WORK/$IFNAME.conf" > "$WORK/check.conf"; then
+    rm -rf -- "$WORK" || warn "could not remove staging directory $WORK"
+    die "new configuration rejected; existing files and tunnel untouched"
+  fi
+  if ! ip link add dev "$CHECK_IF" type wireguard; then
+    rm -rf -- "$WORK" || warn "could not remove staging directory $WORK"
+    die "could not create validation interface; existing files and tunnel untouched"
+  fi
+  if ! wg setconf "$CHECK_IF" "$WORK/check.conf"; then
+    VALID=0
+  fi
+  ip link delete dev "$CHECK_IF" \
+    || die "could not remove validation interface $CHECK_IF; existing tunnel untouched (staging: $WORK)"
+  if [ "$VALID" != "1" ]; then
+    rm -rf -- "$WORK" || warn "could not remove staging directory $WORK"
+    die "new configuration rejected; existing files and tunnel untouched"
+  fi
+
+  # Apply the staged files only after the old tunnel has stopped successfully.
+  local FAILED="" CLEANED=1 RESTORED=1
   if [ "$WAS_UP" = "1" ]; then
-    cp "$CONF" "$CONF.rollback" 2>/dev/null || true
-    wg-quick down "$IFNAME" >/dev/null 2>&1 || true
-  fi
-  if ! wg-quick up "$IFNAME" >/dev/null 2>&1; then
-    warn "wg-quick up failed for $IFNAME — rolling back"
-    if [ -f "$CONF.rollback" ]; then
-      cp "$CONF.rollback" "$CONF"
+    if ! wg-quick down "$IFNAME"; then
+      FAILED="could not stop $IFNAME"
     fi
-    if ! wg-quick up "$IFNAME" >/dev/null 2>&1; then
-      die "tunnel $IFNAME could not be brought up (previous config restored; investigate manually)"
-    fi
-    die "new config rejected — previous working config restored and tunnel is UP"
   fi
-  rm -f "$CONF.rollback"
+  if [ -z "$FAILED" ]; then
+    if ! mv -f -- "$WORK/$IFNAME.conf" "$CONF"; then
+      FAILED="could not install client configuration"
+    elif ! mv -f -- "$WORK/client.env" "$ENV"; then
+      FAILED="could not install client environment"
+    elif ! wg-quick up "$IFNAME"; then
+      FAILED="wg-quick up failed for $IFNAME"
+    elif ! wg show "$IFNAME" >/dev/null 2>&1; then
+      FAILED="WireGuard interface $IFNAME is missing after startup"
+    fi
+  fi
+
+  if [ -n "$FAILED" ]; then
+    warn "$FAILED — restoring previous client state"
+    if ip link show "$IFNAME" >/dev/null 2>&1; then
+      if ! wg-quick down "$IFNAME"; then
+        CLEANED=0
+      fi
+      if ip link show "$IFNAME" >/dev/null 2>&1; then
+        CLEANED=0
+      fi
+    fi
+    if [ "$HAD_CONF" = "1" ]; then
+      if ! cp -p -- "$WORK/previous.conf" "$CONF"; then
+        RESTORED=0
+      fi
+    elif ! rm -f -- "$CONF"; then
+      RESTORED=0
+    fi
+    if [ "$HAD_ENV" = "1" ]; then
+      if ! cp -p -- "$WORK/previous.env" "$ENV"; then
+        RESTORED=0
+      fi
+    elif ! rm -f -- "$ENV"; then
+      RESTORED=0
+    fi
+    [ "$RESTORED" = "1" ] \
+      || die "$FAILED; file restoration failed — backups retained at $WORK; manual recovery required"
+    [ "$CLEANED" = "1" ] \
+      || die "$FAILED; previous files restored but interface cleanup failed — backups retained at $WORK; manual recovery required"
+    if [ "$HAD_CONF" != "1" ]; then
+      rm -rf -- "$WORK" || warn "could not remove staging directory $WORK"
+      die "fresh client installation failed: $FAILED"
+    fi
+    if wg-quick up "$IFNAME" && wg show "$IFNAME" >/dev/null 2>&1; then
+      rm -rf -- "$WORK" || warn "could not remove staging directory $WORK"
+      die "rerun failed: $FAILED; previous configuration and client.env restored, tunnel is UP and serving"
+    fi
+    die "$FAILED; previous configuration and client.env restored but tunnel restart failed — backups retained at $WORK; manual recovery required"
+  fi
+  rm -rf -- "$WORK" || warn "could not remove staging directory $WORK"
+
+  # UDP socket buffers help both the kernel interface and userspace (Xray) WG
+  cat > /etc/sysctl.d/99-goldwater-v2.conf <<EOF
+# GoldWaterTunnel v2 tuning
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+EOF
+  sysctl --system >/dev/null 2>&1 || true
 
   # survive reboots: the tunnel must come back on its own (report honestly)
   if systemctl enable "wg-quick@$IFNAME" >/dev/null 2>&1 \
@@ -265,7 +368,7 @@ EOF
   RAM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
   SWAP_MB=$(awk '/SwapTotal/{print int($2/1024)}' /proc/meminfo)
   AVAIL_MB=$(df -PBM / | awk 'NR==2{gsub("M","",$4); print int($4)}')
-  if [ "$RAM_MB" -le 4096 ] && [ "$SWAP_MB" -lt 512 ] && [ ! -f /swapfile.gwt ]; then
+  if [ "$RAM_MB" -le 4096 ] && [ "$SWAP_MB" -lt 512 ] && [ ! -e /swapfile.gwt ] && [ ! -L /swapfile.gwt ]; then
     SWAP_MB_TO_MAKE=0
     if [ "$AVAIL_MB" -ge 4096 ]; then
       SWAP_MB_TO_MAKE=2048
@@ -275,22 +378,46 @@ EOF
       warn "low RAM (${RAM_MB}MB) and no swap, but only ${AVAIL_MB}MB free — skipping swapfile"
     fi
     if [ "${GWT_NO_SWAP:-0}" != "1" ] && [ "$SWAP_MB_TO_MAKE" -gt 0 ]; then
-      say "low RAM (${RAM_MB}MB) with no swap — creating ${SWAP_MB_TO_MAKE}MB safety swapfile (GWT_NO_SWAP=1 to skip)"
-      if dd if=/dev/zero of=/swapfile.gwt bs=1M count="$SWAP_MB_TO_MAKE" status=none 2>/dev/null \
-         && chmod 600 /swapfile.gwt \
-         && mkswap /swapfile.gwt >/dev/null 2>&1 \
-         && swapon /swapfile.gwt; then
-        grep -q '/swapfile.gwt' /etc/fstab || echo '/swapfile.gwt none swap sw 0 0' >> /etc/fstab
-        sysctl -qw vm.swappiness=10
-        grep -q 'vm.swappiness' /etc/sysctl.d/99-goldwater-v2.conf 2>/dev/null || \
-          echo 'vm.swappiness = 10' >> /etc/sysctl.d/99-goldwater-v2.conf
-        ok "safety swap active (${SWAP_MB_TO_MAKE}MB, swappiness=10)"
+      local SWAP_WORK OLD_SWAPPINESS SWAP_RESTORED=1
+      SWAP_WORK=$(mktemp -d /etc/.gwt-swap.XXXXXX) \
+        || die "could not create swap recovery directory; client tunnel is UP"
+      if cp -p -- /etc/fstab "$SWAP_WORK/fstab" \
+         && cp -p -- /etc/sysctl.d/99-goldwater-v2.conf "$SWAP_WORK/sysctl.conf" \
+         && OLD_SWAPPINESS=$(sysctl -n vm.swappiness); then
+        say "low RAM (${RAM_MB}MB) with no swap — creating ${SWAP_MB_TO_MAKE}MB safety swapfile (GWT_NO_SWAP=1 to skip)"
+        if dd if=/dev/zero of=/swapfile.gwt bs=1M count="$SWAP_MB_TO_MAKE" status=none 2>/dev/null \
+           && chmod 600 /swapfile.gwt \
+           && mkswap /swapfile.gwt >/dev/null 2>&1 \
+           && swapon /swapfile.gwt \
+           && { grep -q '/swapfile.gwt' /etc/fstab || echo '/swapfile.gwt none swap sw 0 0' >> /etc/fstab; } \
+           && sysctl -qw vm.swappiness=10 \
+           && { grep -q 'vm.swappiness' /etc/sysctl.d/99-goldwater-v2.conf || echo 'vm.swappiness = 10' >> /etc/sysctl.d/99-goldwater-v2.conf; }; then
+          ok "safety swap active (${SWAP_MB_TO_MAKE}MB, swappiness=10)"
+        else
+          warn "swap creation failed — cleaning up and continuing without it"
+          if awk '$1 == "/swapfile.gwt" {found=1} END {exit !found}' /proc/swaps; then
+            swapoff /swapfile.gwt \
+              || die "could not deactivate failed swap setup; active file retained, backups at $SWAP_WORK"
+          fi
+          if ! rm -f -- /swapfile.gwt; then
+            SWAP_RESTORED=0
+          fi
+          if ! cp -p -- "$SWAP_WORK/fstab" /etc/fstab; then
+            SWAP_RESTORED=0
+          fi
+          if ! cp -p -- "$SWAP_WORK/sysctl.conf" /etc/sysctl.d/99-goldwater-v2.conf; then
+            SWAP_RESTORED=0
+          fi
+          if ! sysctl -qw "vm.swappiness=$OLD_SWAPPINESS"; then
+            SWAP_RESTORED=0
+          fi
+          [ "$SWAP_RESTORED" = "1" ] \
+            || die "swap cleanup failed; backups retained at $SWAP_WORK; client tunnel is UP"
+        fi
       else
-        warn "swap creation failed — cleaning up and continuing without it"
-        swapoff /swapfile.gwt >/dev/null 2>&1 || true
-        rm -f /swapfile.gwt
-        sed -i '\#/swapfile.gwt#d' /etc/fstab 2>/dev/null || true
+        warn "could not snapshot swap settings — skipping swapfile"
       fi
+      rm -rf -- "$SWAP_WORK" || warn "could not remove swap recovery directory $SWAP_WORK"
     fi
   fi
 
