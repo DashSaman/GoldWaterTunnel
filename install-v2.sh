@@ -19,7 +19,7 @@
 #===============================================================================
 set -euo pipefail
 
-GWT_VERSION="2.1.0"
+GWT_VERSION="2.2.0"
 WG_DIR="/etc/wireguard"
 GWT_DIR="/etc/goldwater-v2"
 
@@ -173,9 +173,17 @@ do_client() {
   local NET="10.70.0"
   local ADDR="${NET}.$(( (LAST % 249) + 2 ))"
 
+  # reuse existing keys on re-install so reruns never orphan the server-side peer
+  local CONF="$WG_DIR/$IFNAME.conf"
   local PRIV PUB
-  PRIV=$(wg genkey)
-  PUB=$(echo "$PRIV" | wg pubkey)
+  if [ -f "$CONF" ] && grep -q '^PrivateKey' "$CONF"; then
+    PRIV=$(grep -m1 '^PrivateKey' "$CONF" | awk '{print $3}')
+    PUB=$(echo "$PRIV" | wg pubkey)
+    say "reusing existing keys for $IFNAME (idempotent re-install)"
+  else
+    PRIV=$(wg genkey)
+    PUB=$(echo "$PRIV" | wg pubkey)
+  fi
 
   mkdir -p "$WG_DIR" "$GWT_DIR/$SERVER"
   cat > "$WG_DIR/$IFNAME.conf" <<EOF
@@ -202,6 +210,12 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 
   # Save for outbound generation
+  # preserve the dedicated Xray peer identity (see do_outbound) across re-installs
+  local XPEER=""
+  if [ -f "$GWT_DIR/$SERVER/client.env" ] && grep -q '^GWT_XPRIV=' "$GWT_DIR/$SERVER/client.env" 2>/dev/null; then
+    XPEER=$(grep -E '^GWT_X(PRIV|PUB|ADDR)=' "$GWT_DIR/$SERVER/client.env")
+  fi
+
   cat > "$GWT_DIR/$SERVER/client.env" <<EOF
 GWT_CLIENT_PRIV=$PRIV
 GWT_CLIENT_PUB=$PUB
@@ -213,9 +227,36 @@ GWT_ADDR=$ADDR
 GWT_GW=${NET}.1
 GWT_IF=$IFNAME
 EOF
+  [ -n "$XPEER" ] && printf '%s\n' "$XPEER" >> "$GWT_DIR/$SERVER/client.env"
   chmod 600 "$GWT_DIR/$SERVER/client.env"
 
+  wg-quick down "$IFNAME" 2>/dev/null || true
   wg-quick up "$IFNAME" 2>/dev/null || true
+
+  # survive reboots: the tunnel must come back on its own
+  systemctl enable "wg-quick@$IFNAME" >/dev/null 2>&1 || true
+  ok "tunnel enabled at boot (wg-quick@$IFNAME)"
+
+  # low-RAM servers without swap can hard-freeze under heavy load; add a safety net
+  local RAM_MB SWAP_MB
+  RAM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+  SWAP_MB=$(awk '/SwapTotal/{print int($2/1024)}' /proc/meminfo)
+  if [ "${GWT_NO_SWAP:-0}" != "1" ] && [ "$RAM_MB" -le 4096 ] && [ "$SWAP_MB" -lt 512 ] && [ ! -f /swapfile.gwt ]; then
+    say "low RAM (${RAM_MB}MB) with no swap — creating 2GB safety swapfile (GWT_NO_SWAP=1 to skip)"
+    if dd if=/dev/zero of=/swapfile.gwt bs=1M count=2048 status=none 2>/dev/null \
+       && chmod 600 /swapfile.gwt \
+       && mkswap /swapfile.gwt >/dev/null 2>&1 \
+       && swapon /swapfile.gwt; then
+      grep -q '/swapfile.gwt' /etc/fstab || echo '/swapfile.gwt none swap sw 0 0' >> /etc/fstab
+      sysctl -qw vm.swappiness=10
+      grep -q 'vm.swappiness' /etc/sysctl.d/99-goldwater-v2.conf 2>/dev/null || \
+        echo 'vm.swappiness = 10' >> /etc/sysctl.d/99-goldwater-v2.conf
+      ok "safety swap active (2GB, swappiness=10)"
+    else
+      rm -f /swapfile.gwt
+      warn "swap creation failed — continuing without it"
+    fi
+  fi
 
   if [ "$IS_NAT" = "1" ]; then
     warn "NAT mode detected (local=$LOCAL_IP public=$PUBLIC_IP)"
