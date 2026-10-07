@@ -3,3 +3,4 @@
 keys.env
 secrets/
 .secrets/
+.mimosa/
