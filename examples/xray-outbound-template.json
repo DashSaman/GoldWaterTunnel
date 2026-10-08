@@ -13,6 +13,7 @@
       }
     ],
     "mtu": 1420,
-    "kernelMode": false
+    "noKernelTun": true,
+    "remoteDNS": ["1.1.1.1"]
   }
 }

@@ -14,12 +14,13 @@
 #    install.sh client  --server IP --port 443 --password X --uuid Y [options]
 #    install.sh print-xray-outbound    (client: print panel outbound JSON)
 #    install.sh update                 (upgrade waterwall binary)
+#    install.sh update-instance --name NAME (upgrade only /etc/goldwater-NAME)
 #    install.sh uninstall
 #===============================================================================
 set -euo pipefail
 
-GWT_VERSION="1.0.0"
-WATERWALL_VERSION="v1.46.9"
+GWT_VERSION="1.1.0"
+WATERWALL_VERSION="v1.46.96"
 WATERWALL_URL_BASE="https://github.com/radkesvat/WaterWall/releases/download"
 GWT_RAW_BASE="https://raw.githubusercontent.com/DashSaman/GoldWaterTunnel/main"
 INSTALL_DIR="/etc/goldwater"
@@ -86,27 +87,113 @@ PYEOF
   [ -n "$WGW_PRIV" ] && [ -n "$WGW_PUB" ] || die "WireGuard key generation failed"
 }
 
-install_binary() {
-  if [ -x "$BIN" ] && "$BIN" -v 2>/dev/null | grep -q "$WATERWALL_VERSION"; then
-    ok "waterwall $WATERWALL_VERSION already installed"
-    return 0
-  fi
-  local url="$WATERWALL_URL_BASE/$WATERWALL_VERSION/Waterwall-linux-gcc-x64.zip"
-  local tmp; tmp="$(mktemp -d)"
-  say "Downloading WaterWall $WATERWALL_VERSION ..."
-  if command -v unzip >/dev/null 2>&1 && curl -fsSL --retry 3 --connect-timeout 15 -o "$tmp/ww.zip" "$url"; then
-    unzip -o -q "$tmp/ww.zip" -d "$tmp/rel"
-    install -m 755 "$tmp/rel/Waterwall" "$BIN"
-  elif [ -f "${GWT_LOCAL_BIN:-/nonexistent}" ]; then
-    install -m 755 "$GWT_LOCAL_BIN" "$BIN"
+select_release_asset() {
+  local flags="${1-}"
+  if [ $# -eq 0 ]; then flags="$(cat /proc/cpuinfo)"; fi
+  if [[ " $flags " =~ (^|[[:space:]])avx2([[:space:]]|$) ]]; then
+    echo Waterwall-linux-gcc-x64.zip
   else
-    die "Download failed. If GitHub is unreachable, download $url on another machine,
-copy it to this server, unzip it and re-run with: GWT_LOCAL_BIN=/path/to/Waterwall $0"
+    echo Waterwall-linux-gcc-x64-old-cpu.zip
   fi
-  rm -rf "$tmp"
-  "$BIN" -v | head -1
-  ok "waterwall installed at $BIN"
 }
+
+release_sha256() {
+  case "$1" in
+    Waterwall-linux-gcc-x64.zip) echo 81311d5abc48f6ec4d417b16de1ad478d18d5ed19fc7ef64749b47e0a8099337 ;;
+    Waterwall-linux-gcc-x64-old-cpu.zip) echo 7774dfeb107d8e4e93471cb0964e016ce41ed6b78052948b12d41bef971b488b ;;
+    *) die "unknown release asset: $1" ;;
+  esac
+}
+
+# Download to a caller-owned staging directory; never overwrite a running binary.
+stage_release_binary() {
+  local dest="$1" asset expected version
+  asset="$(select_release_asset)"
+  expected="$(release_sha256 "$asset")"
+  mkdir -p "$dest" || die "cannot create staging directory"
+  if [ -n "${GWT_LOCAL_ARCHIVE:-}" ]; then
+    cp -- "$GWT_LOCAL_ARCHIVE" "$dest/release.zip" || die "cannot copy local release archive"
+  else
+    curl -fL --retry 3 --connect-timeout 15 --max-time 180 \
+      "$WATERWALL_URL_BASE/$WATERWALL_VERSION/$asset" -o "$dest/release.zip" || die "release download failed"
+  fi
+  printf '%s  %s\n' "$expected" "$dest/release.zip" | sha256sum -c - || die "release checksum mismatch"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -p "$dest/release.zip" Waterwall > "$dest/Waterwall" || die "release extraction failed"
+  else
+    python3 - "$dest/release.zip" "$dest/Waterwall" <<'PYZIP' || die "release extraction failed"
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    data = archive.read('Waterwall')
+with open(sys.argv[2], 'wb') as output:
+    output.write(data)
+PYZIP
+  fi
+  chmod 755 "$dest/Waterwall" || die "cannot prepare staged executable"
+  version="$(timeout -k 2 5 "$dest/Waterwall" -v)" || die "staged binary cannot run on this CPU"
+  [[ "$version" == "Waterwall version ${WATERWALL_VERSION#v}" ]] \
+    || die "unexpected binary version: $version"
+  printf 'version=%s\nasset=%s\narchive_sha256=%s\n' "$WATERWALL_VERSION" "$asset" "$expected" > "$dest/release.txt" || die "cannot save release metadata"
+}
+
+install_binary() (
+  set -euo pipefail
+  local tmp
+  tmp="$(mktemp -d)" || die "cannot create staging directory"
+  trap 'rm -rf -- "$tmp"' EXIT
+  stage_release_binary "$tmp" || die "release staging failed"
+  install -m 755 "$tmp/Waterwall" "$BIN.new" || die "cannot stage installation"
+  mv -f -- "$BIN.new" "$BIN" || die "cannot publish executable"
+  ok "waterwall $WATERWALL_VERSION installed at $BIN ($(select_release_asset))"
+)
+
+validate_instance_name() {
+  [[ "${1-}" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || die "instance name must be 1..32 lowercase letters, digits or hyphens"
+}
+
+validate_instance_exec() {
+  local effective="$1" bin="$2" dir="$3"
+  [[ "$effective" == "{ path=$bin ; argv[]=$bin -c:$dir/core.json ; "* \
+     && "$effective" != *'} {'* && "$effective" != *$'\n'* ]] \
+    || die "effective unit ExecStart does not match isolated instance paths"
+}
+
+# Updates an already configured, isolated instance. Does not touch legacy services,
+# panel settings, routing, sysctls, peers or config/key files.
+do_update_instance() (
+  set -euo pipefail
+  [ "${1-}" = --name ] && [ $# -eq 2 ] || die "usage: update-instance --name NAME"
+  local name="$2" dir bin unit tmp backup old_active effective
+  validate_instance_name "$name"
+  dir="/etc/goldwater-$name"
+  bin="/usr/local/lib/goldwater-$name/Waterwall"
+  unit="goldwater-$name.service"
+  [ -f "$dir/core.json" ] && [ -f "$dir/nodes.json" ] && [ -x "$bin" ] \
+    || die "instance is not configured: $dir"
+  effective="$(systemctl show "$unit" -p ExecStart --value)" || die "cannot inspect effective unit"
+  validate_instance_exec "$effective" "$bin" "$dir"
+  tmp="$(mktemp -d "$(dirname "$bin")/.upgrade.XXXXXX")" || die "cannot create staging directory"
+  trap 'rm -rf -- "$tmp"' EXIT
+  stage_release_binary "$tmp" || die "release staging failed"
+  backup="$bin.backup-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  cp -p -- "$bin" "$backup" || die "cannot back up previous executable"
+  old_active=0
+  if systemctl is-active --quiet "$unit"; then old_active=1; fi
+  mv -f -- "$tmp/Waterwall" "$bin" || die "cannot publish staged executable"
+  if [ "$old_active" = 1 ]; then
+    if ! systemctl restart "$unit" || { sleep 3; ! systemctl is-active --quiet "$unit"; }; then
+      systemctl stop "$unit" || true
+      cp -p -- "$backup" "$bin.rollback" || die "rollback copy failed; backup: $backup"
+      mv -f -- "$bin.rollback" "$bin" || die "rollback publish failed; backup: $backup"
+      systemctl reset-failed "$unit" || true
+      systemctl start "$unit" || die "rollback restart failed; backup: $backup"
+      die "new version failed startup; previous binary restored: $backup"
+    fi
+  fi
+  install -m 600 "$tmp/release.txt" "$dir/release.txt" || die "binary updated, but release metadata save failed"
+  ok "$unit updated to $WATERWALL_VERSION; prior binary: $backup"
+  [ "$old_active" = 1 ] || warn "instance was inactive and remains inactive"
+)
 
 write_sysctl() {
   local bbr="$1"
@@ -172,7 +259,7 @@ EOF
 #  SERVER ROLE (abroad)
 #===============================================================================
 do_server() {
-  local PORT="443" COVER="www.microsoft.com" RSECRET="" WORKERS="" UUID=""
+  local PORT="443" COVER="www.google.com" RSECRET="" WORKERS="" UUID=""
   while [ $# -gt 0 ]; do case "$1" in
     --port) PORT="$2"; shift 2 ;;
     --cover) COVER="$2"; shift 2 ;;
@@ -317,7 +404,7 @@ SUMMARY
 #  CLIENT ROLE (Iran)
 #===============================================================================
 do_client() {
-  local SERVER="" PORT="443" RSECRET="" COVER="www.microsoft.com" WG_PORT="51820" \
+  local SERVER="" PORT="443" RSECRET="" COVER="www.google.com" WG_PORT="51820" \
         TEST_PORT="40000" FISHER="2" WORKERS="" SERVER_SSH="root@" UUID=""
   while [ $# -gt 0 ]; do case "$1" in
     --server) SERVER="$2"; shift 2 ;;
@@ -517,7 +604,8 @@ EOF
       }
     ],
     "mtu": 1420,
-    "kernelMode": false
+    "noKernelTun": true,
+    "remoteDNS": ["1.1.1.1"]
   }
 }
 EOF
@@ -698,9 +786,10 @@ main() {
     client)          do_client "$@" ;;
     print-xray-outbound) do_print_xray ;;
     update)          do_update ;;
+    update-instance) do_update_instance "$@" ;;
     uninstall)       do_uninstall ;;
     help|-h|--help)  sed -n '2,16p' "$0" ;;
     *) die "unknown command: $cmd (see help)" ;;
   esac
 }
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
